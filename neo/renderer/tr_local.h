@@ -602,7 +602,7 @@ typedef struct {
 	textureType_t	textureType;
 } tmu_t;
 
-const int MAX_MULTITEXTURE_UNITS =	8;
+const int MAX_MULTITEXTURE_UNITS =	9; // includes the soft-shadow blue-noise sampler
 typedef struct {
 	tmu_t		tmu[MAX_MULTITEXTURE_UNITS];
 	int			currenttmu;
@@ -992,6 +992,8 @@ extern idCVar r_debugRenderToTexture;
 extern idCVar r_glDebugContext; // DG: use debug context to call logging callbacks on GL errors
 extern idCVar r_enableDepthCapture; // DG: disable capturing depth buffer, used for soft particles
 extern idCVar r_useSoftParticles;
+extern idCVar r_useSoftShadows;
+extern idCVar r_softShadowRadius;
 
 /*
 ====================================================================
@@ -1333,6 +1335,9 @@ typedef enum {
 	// SteveL #3878: soft particles
 	VPROG_SOFT_PARTICLE,
 	FPROG_SOFT_PARTICLE,
+	// Experimental depth-aware stencil-shadow filter.
+	VPROG_SOFT_INTERACTION,
+	FPROG_SOFT_INTERACTION,
 	//
 	PROG_USER
 } program_t;

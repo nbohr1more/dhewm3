@@ -559,12 +559,12 @@ void RB_STD_FillDepthBuffer( drawSurf_t **drawSurfs, int numDrawSurfs ) {
 
 	// Make the early depth pass available to shaders. #3877
 	bool getDepthCapture = r_enableDepthCapture.GetInteger() == 1
-		|| (r_enableDepthCapture.GetInteger() == -1 && r_useSoftParticles.GetBool());
+		|| (r_enableDepthCapture.GetInteger() == -1 && (r_useSoftParticles.GetBool() || r_useSoftShadows.GetBool()));
 
 	if ( getDepthCapture && backEnd.viewDef->renderView.viewID >= 0 ) // Suppress for lightgem rendering passes
 	{
-		globalImages->currentDepthImage->CopyDepthbuffer( backEnd.viewDef->viewport.x1,
-														  backEnd.viewDef->viewport.y1,
+		globalImages->currentDepthImage->CopyDepthbuffer( tr.viewportOffset[0] + backEnd.viewDef->viewport.x1,
+											  tr.viewportOffset[1] + backEnd.viewDef->viewport.y1,
 														  backEnd.viewDef->viewport.x2 - backEnd.viewDef->viewport.x1 + 1,
 														  backEnd.viewDef->viewport.y2 - backEnd.viewDef->viewport.y1 + 1, 
 														  true );

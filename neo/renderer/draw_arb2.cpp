@@ -57,6 +57,243 @@ static void GL_SelectTextureNoClient( int unit ) {
 	qglActiveTextureARB( GL_TEXTURE0_ARB + unit );
 }
 
+
+// The soft-shadow path converts the existing stencil test into a color mask
+// entirely on the GPU.  We preserve the current backbuffer color in a texture,
+// draw the stencil result into the backbuffer, copy that result to a luminance
+// texture, then restore the original color.
+static GLuint rbSoftShadowMaskTexture = 0;
+static idImage *rbSoftShadowBlueNoiseImage = NULL;
+static GLuint rbSoftShadowColorBackupTexture = 0;
+static int rbSoftShadowMaskWidth = 0;
+static int rbSoftShadowMaskHeight = 0;
+static int rbSoftShadowBackupWidth = 0;
+static int rbSoftShadowBackupHeight = 0;
+static bool rbUseSoftShadowForInteractions = false;
+
+static bool RB_SoftShadowsEnabled( void ) {
+	return r_useSoftShadows.GetBool()
+		&& r_shadows.GetBool()
+		&& glConfig.maxTextureImageUnits >= 9
+		&& !r_testARBProgram.GetBool()
+		&& r_enableDepthCapture.GetInteger() != 0
+		&& backEnd.viewDef->renderView.viewID >= 0;
+}
+
+static void RB_DrawSoftShadowQuad( bool textured ) {
+	qglBegin( GL_QUADS );
+	if ( textured ) qglTexCoord2f( 0.0f, 0.0f );
+	qglVertex3f( -1.0f, -1.0f, 0.0f );
+	if ( textured ) qglTexCoord2f( 1.0f, 0.0f );
+	qglVertex3f(  1.0f, -1.0f, 0.0f );
+	if ( textured ) qglTexCoord2f( 1.0f, 1.0f );
+	qglVertex3f(  1.0f,  1.0f, 0.0f );
+	if ( textured ) qglTexCoord2f( 0.0f, 1.0f );
+	qglVertex3f( -1.0f,  1.0f, 0.0f );
+	qglEnd();
+}
+
+static void RB_EnsureSoftShadowTexture( GLuint &texture, int &oldWidth, int &oldHeight,
+		int width, int height, GLenum internalFormat, GLenum format ) {
+	if ( texture == 0 ) {
+		qglGenTextures( 1, &texture );
+	}
+	qglBindTexture( GL_TEXTURE_2D, texture );
+	qglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
+	qglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
+	qglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+	qglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+	if ( width != oldWidth || height != oldHeight ) {
+		qglTexImage2D( GL_TEXTURE_2D, 0, internalFormat, width, height, 0, format, GL_UNSIGNED_BYTE, NULL );
+		oldWidth = width;
+		oldHeight = height;
+	}
+}
+
+static void RB_CaptureSoftShadowMask( bool hasShadowVolumes ) {
+	const idScreenRect &vp = backEnd.viewDef->viewport;
+	const idScreenRect &lightScissor = backEnd.vLight->scissorRect;
+	const int width = vp.x2 - vp.x1 + 1;
+	const int height = vp.y2 - vp.y1 + 1;
+	if ( width <= 0 || height <= 0 ) {
+		return;
+	}
+
+	// idScreenRect values are view-relative; GL viewport/scissor and copy
+	// operations use framebuffer coordinates.
+	const int viewportX = tr.viewportOffset[0] + vp.x1;
+	const int viewportY = tr.viewportOffset[1] + vp.y1;
+
+	// Clip the light scissor to this view.  The light scissor is used even
+	// when r_useScissor is disabled: pixels outside it cannot be lit by this
+	// light, and must not inherit stale stencil values from another light.
+	int sx1 = Max( static_cast<int>( lightScissor.x1 ), 0 );
+	int sy1 = Max( static_cast<int>( lightScissor.y1 ), 0 );
+	int sx2 = Min( static_cast<int>( lightScissor.x2 ) + 1, width );
+	int sy2 = Min( static_cast<int>( lightScissor.y2 ) + 1, height );
+	const int scissorWidth = sx2 - sx1;
+	const int scissorHeight = sy2 - sy1;
+
+	GLint oldActiveTexture = GL_TEXTURE0_ARB;
+	GLint oldMatrixMode = GL_MODELVIEW;
+	GLint oldTexture2D = 0;
+	GLint oldViewport[4];
+	GLint oldDrawBuffer = GL_BACK;
+	GLint oldReadBuffer = GL_BACK;
+	qglGetIntegerv( GL_VIEWPORT, oldViewport );
+	qglGetIntegerv( GL_DRAW_BUFFER, &oldDrawBuffer );
+	qglGetIntegerv( GL_READ_BUFFER, &oldReadBuffer );
+	qglGetIntegerv( GL_ACTIVE_TEXTURE_ARB, &oldActiveTexture );
+	qglGetIntegerv( GL_MATRIX_MODE, &oldMatrixMode );
+	qglPushAttrib( GL_ALL_ATTRIB_BITS );
+
+	qglActiveTextureARB( GL_TEXTURE0_ARB );
+	qglGetIntegerv( GL_TEXTURE_BINDING_2D, &oldTexture2D );
+
+	// Preserve the color already rendered for this view.  The backbuffer is
+	// used temporarily as a mask target, then restored before returning.
+	RB_EnsureSoftShadowTexture( rbSoftShadowColorBackupTexture,
+		rbSoftShadowBackupWidth, rbSoftShadowBackupHeight,
+		width, height, GL_RGBA8, GL_RGBA );
+	qglReadBuffer( oldDrawBuffer );
+	qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0,
+		viewportX, viewportY, width, height );
+
+	RB_EnsureSoftShadowTexture( rbSoftShadowMaskTexture,
+		rbSoftShadowMaskWidth, rbSoftShadowMaskHeight,
+		width, height, GL_LUMINANCE8, GL_LUMINANCE );
+
+	// Fullscreen immediate-mode quad in clip space, restricted by scissor.
+	qglMatrixMode( GL_PROJECTION );
+	qglPushMatrix();
+	qglLoadIdentity();
+	qglMatrixMode( GL_MODELVIEW );
+	qglPushMatrix();
+	qglLoadIdentity();
+	qglMatrixMode( GL_TEXTURE );
+	qglPushMatrix();
+	qglLoadIdentity();
+	qglMatrixMode( GL_MODELVIEW );
+
+	qglDisable( GL_VERTEX_PROGRAM_ARB );
+	qglDisable( GL_FRAGMENT_PROGRAM_ARB );
+	qglDisable( GL_DEPTH_TEST );
+	qglDepthMask( GL_FALSE );
+	qglDisable( GL_BLEND );
+	qglDisable( GL_CULL_FACE );
+	qglDisable( GL_ALPHA_TEST );
+	qglDisable( GL_FOG );
+	qglDisable( GL_LIGHTING );
+	qglDisable( GL_COLOR_LOGIC_OP );
+	qglDisable( GL_DITHER );
+	qglDisable( GL_POLYGON_OFFSET_FILL );
+	qglDisable( GL_TEXTURE_GEN_S );
+	qglDisable( GL_TEXTURE_GEN_T );
+	qglDisable( GL_TEXTURE_GEN_R );
+	qglDisable( GL_TEXTURE_GEN_Q );
+	qglPolygonMode( GL_FRONT_AND_BACK, GL_FILL );
+	qglDisable( GL_TEXTURE_2D );
+	qglColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
+
+	// Start with a fully-lit mask.  This also initializes pixels outside the
+	// light scissor, avoiding view-dependent remnants from previous captures.
+	qglDisable( GL_STENCIL_TEST );
+	qglEnable( GL_SCISSOR_TEST );
+	qglScissor( viewportX, viewportY, width, height );
+	qglClearColor( 1.0f, 1.0f, 1.0f, 1.0f );
+	qglClear( GL_COLOR_BUFFER_BIT );
+
+	// The interaction pass accepts stencil >= 128.  Therefore stencil < 128
+	// is the shadowed region and is written as black into the visibility mask.
+	if ( hasShadowVolumes && scissorWidth > 0 && scissorHeight > 0 ) {
+		qglScissor( viewportX + sx1, viewportY + sy1,
+			scissorWidth, scissorHeight );
+		qglEnable( GL_STENCIL_TEST );
+		qglStencilMask( 0 );
+		qglStencilFunc( GL_LESS, 128, 255 );
+		qglStencilOp( GL_KEEP, GL_KEEP, GL_KEEP );
+		qglColor4f( 0.0f, 0.0f, 0.0f, 1.0f );
+		RB_DrawSoftShadowQuad( false );
+	}
+
+	// Copy the complete viewport mask to texture unit zero's texture object.
+	qglDisable( GL_STENCIL_TEST );
+	qglDisable( GL_SCISSOR_TEST );
+	qglBindTexture( GL_TEXTURE_2D, rbSoftShadowMaskTexture );
+	qglReadBuffer( oldDrawBuffer );
+	qglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0,
+		viewportX, viewportY, width, height );
+
+	// Restore the original framebuffer color from the backup texture.
+	qglEnable( GL_TEXTURE_2D );
+	qglBindTexture( GL_TEXTURE_2D, rbSoftShadowColorBackupTexture );
+	qglTexEnvi( GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE );
+	qglColor4f( 1.0f, 1.0f, 1.0f, 1.0f );
+	RB_DrawSoftShadowQuad( true );
+
+	qglMatrixMode( GL_TEXTURE );
+	qglPopMatrix();
+	qglMatrixMode( GL_MODELVIEW );
+	qglPopMatrix();
+	qglMatrixMode( GL_PROJECTION );
+	qglPopMatrix();
+	qglMatrixMode( oldMatrixMode );
+
+	qglPopAttrib();
+	qglViewport( oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3] );
+	qglDrawBuffer( oldDrawBuffer );
+	qglReadBuffer( oldReadBuffer );
+	qglActiveTextureARB( GL_TEXTURE0_ARB );
+	qglBindTexture( GL_TEXTURE_2D, oldTexture2D );
+	qglActiveTextureARB( oldActiveTexture );
+
+	backEnd.glState.currenttmu = -1;
+	backEnd.glState.forceGlState = true;
+}
+
+static void RB_SetSoftShadowProgramParameters( void ) {
+	const idScreenRect &vp = backEnd.viewDef->viewport;
+	const float width = (float)( vp.x2 - vp.x1 + 1 );
+	const float height = (float)( vp.y2 - vp.y1 + 1 );
+	float parm[4];
+
+	// ARB_fragment_program guarantees only 24 environment parameters
+	// (indices 0..23).  The previous implementation used 25..29, which
+	// silently generated GL_INVALID_VALUE on conforming implementations.
+	// Pack the five vectors into the three unused interaction slots 18..20.
+	parm[0] = 1.0f / width;
+	parm[1] = 1.0f / height;
+	parm[2] = -(float)( tr.viewportOffset[0] + vp.x1 ) / width;
+	parm[3] = -(float)( tr.viewportOffset[1] + vp.y1 ) / height;
+	qglProgramEnvParameter4fvARB( GL_FRAGMENT_PROGRAM_ARB, 18, parm );
+
+	parm[0] = width / (float)globalImages->currentDepthImage->uploadWidth;
+	parm[1] = height / (float)globalImages->currentDepthImage->uploadHeight;
+	parm[2] = 0.0025f; // depth discontinuity threshold in device-depth space
+	parm[3] = 0.0f;
+	qglProgramEnvParameter4fvARB( GL_FRAGMENT_PROGRAM_ARB, 19, parm );
+
+	parm[0] = r_softShadowRadius.GetFloat() / width;
+	parm[1] = r_softShadowRadius.GetFloat() / height;
+	parm[2] = 0.0f;
+	parm[3] = 0.0f;
+	qglProgramEnvParameter4fvARB( GL_FRAGMENT_PROGRAM_ARB, 20, parm );
+
+	// Tile the 128x128 blue-noise texture in framebuffer-pixel space.
+	parm[0] = 1.0f / 128.0f;
+	parm[1] = 1.0f / 128.0f;
+	parm[2] = 0.0f;
+	parm[3] = 0.0f;
+	qglProgramEnvParameter4fvARB( GL_FRAGMENT_PROGRAM_ARB, 22, parm );
+
+	// Per-pixel sub-texel jitter, limited to half the configured filter radius.
+	parm[0] = 0.5f * r_softShadowRadius.GetFloat() / width;
+	parm[1] = 0.5f * r_softShadowRadius.GetFloat() / height;
+	parm[2] = 0.0f;
+	parm[3] = 0.0f;
+	qglProgramEnvParameter4fvARB( GL_FRAGMENT_PROGRAM_ARB, 23, parm );
+}
+
 /*
 ==================
 RB_ARB2_DrawInteraction
@@ -157,9 +394,20 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
 	GL_State( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE | GLS_DEPTHMASK | backEnd.depthFunc );
 
 	// bind the vertex program
+	const bool useSoftShadowProgram = rbUseSoftShadowForInteractions
+		&& RB_SoftShadowsEnabled() && !backEnd.vLight->lightShader->IsAmbientLight();
+	// The captured visibility texture replaces the hard stencil rejection for
+	// this batch; otherwise the filtered edge would still be clipped to binary
+	// stencil coverage and could never become soft.
+	if ( useSoftShadowProgram ) {
+		qglDisable( GL_STENCIL_TEST );
+	}
 	if ( r_testARBProgram.GetBool() ) {
 		qglBindProgramARB( GL_VERTEX_PROGRAM_ARB, VPROG_TEST );
 		qglBindProgramARB( GL_FRAGMENT_PROGRAM_ARB, FPROG_TEST );
+	} else if ( useSoftShadowProgram ) {
+		qglBindProgramARB( GL_VERTEX_PROGRAM_ARB, VPROG_SOFT_INTERACTION );
+		qglBindProgramARB( GL_FRAGMENT_PROGRAM_ARB, FPROG_SOFT_INTERACTION );
 	} else {
 		qglBindProgramARB( GL_VERTEX_PROGRAM_ARB, VPROG_INTERACTION );
 		qglBindProgramARB( GL_FRAGMENT_PROGRAM_ARB, FPROG_INTERACTION );
@@ -175,9 +423,33 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
 	qglEnableVertexAttribArrayARB( 11 );
 	qglEnableClientState( GL_COLOR_ARRAY );
 
-	// texture 0 is the normalization cube map for the vector towards the light
+	// Texture 0 is the normalizer for the regular shader, or the captured
+	// screen-space stencil visibility mask for the soft-shadow variant.
 	GL_SelectTextureNoClient( 0 );
-	if ( backEnd.vLight->lightShader->IsAmbientLight() ) {
+	if ( useSoftShadowProgram ) {
+		// The capture helper restores the original texture bindings after its
+		// temporary backbuffer pass, so explicitly bind the generated mask here.
+		tmu_t *maskTMU = &backEnd.glState.tmu[0];
+		if ( maskTMU->textureType != TT_2D ) {
+			if ( maskTMU->textureType == TT_CUBIC ) qglDisable( GL_TEXTURE_CUBE_MAP_EXT );
+			else if ( maskTMU->textureType == TT_3D ) qglDisable( GL_TEXTURE_3D );
+			qglEnable( GL_TEXTURE_2D );
+			maskTMU->textureType = TT_2D;
+		}
+		if ( maskTMU->current2DMap != (int)rbSoftShadowMaskTexture ) {
+			qglBindTexture( GL_TEXTURE_2D, rbSoftShadowMaskTexture );
+			maskTMU->current2DMap = rbSoftShadowMaskTexture;
+		}
+		RB_SetSoftShadowProgramParameters();
+		GL_SelectTextureNoClient( 7 );
+		globalImages->currentDepthImage->Bind();
+		GL_SelectTextureNoClient( 8 );
+		if ( rbSoftShadowBlueNoiseImage ) {
+			rbSoftShadowBlueNoiseImage->Bind();
+		} else {
+			globalImages->BindNull();
+		}
+	} else if ( backEnd.vLight->lightShader->IsAmbientLight() ) {
 		globalImages->ambientNormalMap->Bind();
 	} else {
 		globalImages->normalCubeMapImage->Bind();
@@ -216,6 +488,12 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
 	qglDisableClientState( GL_COLOR_ARRAY );
 
 	// disable features
+	if ( useSoftShadowProgram ) {
+		GL_SelectTextureNoClient( 8 );
+		globalImages->BindNull();
+		GL_SelectTextureNoClient( 7 );
+		globalImages->BindNull();
+	}
 	GL_SelectTextureNoClient( 6 );
 	globalImages->BindNull();
 
@@ -239,6 +517,9 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
 
 	qglDisable(GL_VERTEX_PROGRAM_ARB);
 	qglDisable(GL_FRAGMENT_PROGRAM_ARB);
+	if ( useSoftShadowProgram ) {
+		qglEnable( GL_STENCIL_TEST );
+	}
 }
 
 
@@ -289,21 +570,36 @@ void RB_ARB2_DrawInteractions( void ) {
 			qglStencilFunc( GL_ALWAYS, 128, 255 );
 		}
 
+		const bool softShadows = RB_SoftShadowsEnabled();
 		if ( r_useShadowVertexProgram.GetBool() ) {
 			qglEnable( GL_VERTEX_PROGRAM_ARB );
 			qglBindProgramARB( GL_VERTEX_PROGRAM_ARB, VPROG_STENCIL_SHADOW );
 			RB_StencilShadowPass( vLight->globalShadows );
+			const bool softGlobalShadows = softShadows && vLight->globalShadows != NULL;
+			if ( softGlobalShadows ) RB_CaptureSoftShadowMask( true );
+			rbUseSoftShadowForInteractions = softGlobalShadows;
 			RB_ARB2_CreateDrawInteractions( vLight->localInteractions );
 			qglEnable( GL_VERTEX_PROGRAM_ARB );
 			qglBindProgramARB( GL_VERTEX_PROGRAM_ARB, VPROG_STENCIL_SHADOW );
 			RB_StencilShadowPass( vLight->localShadows );
+			const bool softLocalShadows = softShadows && vLight->localShadows != NULL;
+			if ( softLocalShadows ) RB_CaptureSoftShadowMask( true );
+			rbUseSoftShadowForInteractions = softLocalShadows;
 			RB_ARB2_CreateDrawInteractions( vLight->globalInteractions );
+			rbUseSoftShadowForInteractions = false;
 			qglDisable( GL_VERTEX_PROGRAM_ARB );	// if there weren't any globalInteractions, it would have stayed on
 		} else {
 			RB_StencilShadowPass( vLight->globalShadows );
+			const bool softGlobalShadows = softShadows && vLight->globalShadows != NULL;
+			if ( softGlobalShadows ) RB_CaptureSoftShadowMask( true );
+			rbUseSoftShadowForInteractions = softGlobalShadows;
 			RB_ARB2_CreateDrawInteractions( vLight->localInteractions );
 			RB_StencilShadowPass( vLight->localShadows );
+			const bool softLocalShadows = softShadows && vLight->localShadows != NULL;
+			if ( softLocalShadows ) RB_CaptureSoftShadowMask( true );
+			rbUseSoftShadowForInteractions = softLocalShadows;
 			RB_ARB2_CreateDrawInteractions( vLight->globalInteractions );
+			rbUseSoftShadowForInteractions = false;
 		}
 
 		// translucent surfaces never get stencil shadowed
@@ -356,6 +652,8 @@ static progDef_t	progs[MAX_GLPROGS] = {
 	// SteveL #3878: Particle softening applied by the engine
 	{ GL_VERTEX_PROGRAM_ARB, VPROG_SOFT_PARTICLE, "soft_particle.vfp" },
 	{ GL_FRAGMENT_PROGRAM_ARB, FPROG_SOFT_PARTICLE, "soft_particle.vfp" },
+	{ GL_VERTEX_PROGRAM_ARB, VPROG_SOFT_INTERACTION, "interaction.vfp" },
+	{ GL_FRAGMENT_PROGRAM_ARB, FPROG_SOFT_INTERACTION, "interaction_soft.fp" },
 
 	// additional programs can be dynamically specified in materials
 };
@@ -778,6 +1076,16 @@ R_ARB2_Init
 ==================
 */
 void R_ARB2_Init( void ) {
+	// The GL context can be recreated by vid_restart; discard the old context's
+	// lazily-created stencil texture name and allocate a fresh one on demand.
+	rbSoftShadowMaskTexture = 0;
+	rbSoftShadowColorBackupTexture = 0;
+	rbSoftShadowMaskWidth = 0;
+	rbSoftShadowMaskHeight = 0;
+	rbSoftShadowBackupWidth = 0;
+	rbSoftShadowBackupHeight = 0;
+	rbUseSoftShadowForInteractions = false;
+	rbSoftShadowBlueNoiseImage = NULL;
 	glConfig.allowARB2Path = false;
 
 	common->Printf( "ARB2 renderer: " );
@@ -790,4 +1098,6 @@ void R_ARB2_Init( void ) {
 	common->Printf( "Available.\n" );
 
 	glConfig.allowARB2Path = true;
+	rbSoftShadowBlueNoiseImage = globalImages->ImageFromFile(
+		"textures/blue_noise_128.tga", TF_DEFAULT, false, TR_REPEAT, TD_DEFAULT );
 }
