@@ -253,6 +253,14 @@ idCVar r_enableDepthCapture( "r_enableDepthCapture", "-1", CVAR_RENDERER | CVAR_
 idCVar r_useSoftParticles( "r_useSoftParticles", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL, "Soften particle transitions when player walks through them or they cross solid geometry. Needs r_enableDepthCapture. Can slow down rendering!" ); // #3878
 idCVar r_useSoftShadows( "r_useSoftShadows", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL, "Apply depth-aware screen-space filtering to stencil shadow edges. Experimental; requires depth capture and can be very slow." );
 idCVar r_softShadowRadius( "r_softShadowRadius", "2", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "Screen-space soft shadow filter radius in pixels (0.5 to 6).", 0.5f, 6.0f );
+idCVar r_useSSAO( "r_useSSAO", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL,
+		"Apply experimental screen-space ambient occlusion to ambient light interactions. Requires depth capture." );
+idCVar r_ssaoRadius( "r_ssaoRadius", "12", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT,
+		"Screen-space ambient occlusion sampling radius in pixels.", 1.0f, 48.0f );
+idCVar r_ssaoStrength( "r_ssaoStrength", "0.65", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT,
+		"Screen-space ambient occlusion strength.", 0.0f, 2.0f );
+idCVar r_ssaoBias( "r_ssaoBias", "1.5", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT,
+		"Screen-space ambient occlusion depth bias in game units.", 0.0f, 16.0f );
 
 idCVar r_glDebugContext( "r_glDebugContext", "0", CVAR_RENDERER | CVAR_BOOL, "Enable OpenGL Debug context - requires vid_restart, needs SDL2" );
 

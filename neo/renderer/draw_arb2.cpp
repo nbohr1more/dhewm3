@@ -80,6 +80,49 @@ static bool RB_SoftShadowsEnabled( void ) {
 		&& backEnd.viewDef->renderView.viewID >= 0;
 }
 
+static bool RB_SSAOEnabled( void ) {
+	return r_useSSAO.GetBool()
+		&& glConfig.maxTextureImageUnits >= 9
+		&& !r_testARBProgram.GetBool()
+		&& r_enableDepthCapture.GetInteger() != 0
+		&& backEnd.viewDef->renderView.viewID >= 0;
+}
+
+static void RB_SetSSAOProgramParameters( void ) {
+	const idScreenRect &vp = backEnd.viewDef->viewport;
+	const float width = (float)( vp.x2 - vp.x1 + 1 );
+	const float height = (float)( vp.y2 - vp.y1 + 1 );
+	const float *projection = backEnd.viewDef->projectionMatrix;
+	float parm[4];
+
+	// Viewport-local coordinates, matching the depth capture's copy rectangle.
+	parm[0] = 1.0f / width;
+	parm[1] = 1.0f / height;
+	parm[2] = -(float)( tr.viewportOffset[0] + vp.x1 ) / width;
+	parm[3] = -(float)( tr.viewportOffset[1] + vp.y1 ) / height;
+	qglProgramEnvParameter4fvARB( GL_FRAGMENT_PROGRAM_ARB, 18, parm );
+
+	// Depth texture UV scale and the projection coefficients used to
+	// reconstruct positive eye-space distance from the hardware depth value.
+	parm[0] = width / (float)globalImages->currentDepthImage->uploadWidth;
+	parm[1] = height / (float)globalImages->currentDepthImage->uploadHeight;
+	parm[2] = projection[10];
+	parm[3] = projection[14];
+	qglProgramEnvParameter4fvARB( GL_FRAGMENT_PROGRAM_ARB, 19, parm );
+
+	parm[0] = r_ssaoRadius.GetFloat() / width;
+	parm[1] = r_ssaoRadius.GetFloat() / height;
+	parm[2] = r_ssaoBias.GetFloat();
+	parm[3] = r_ssaoStrength.GetFloat();
+	qglProgramEnvParameter4fvARB( GL_FRAGMENT_PROGRAM_ARB, 20, parm );
+
+	parm[0] = 1.0f / 128.0f;
+	parm[1] = 1.0f / 128.0f;
+	parm[2] = 0.0f;
+	parm[3] = 0.0f;
+	qglProgramEnvParameter4fvARB( GL_FRAGMENT_PROGRAM_ARB, 22, parm );
+}
+
 static void RB_DrawSoftShadowQuad( bool textured ) {
 	qglBegin( GL_QUADS );
 	if ( textured ) qglTexCoord2f( 0.0f, 0.0f );
@@ -396,6 +439,8 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
 	// bind the vertex program
 	const bool useSoftShadowProgram = rbUseSoftShadowForInteractions
 		&& RB_SoftShadowsEnabled() && !backEnd.vLight->lightShader->IsAmbientLight();
+	const bool useAmbientSSAOProgram = !r_testARBProgram.GetBool()
+		&& backEnd.vLight->lightShader->IsAmbientLight() && RB_SSAOEnabled();
 	// The captured visibility texture replaces the hard stencil rejection for
 	// this batch; otherwise the filtered edge would still be clipped to binary
 	// stencil coverage and could never become soft.
@@ -408,6 +453,9 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
 	} else if ( useSoftShadowProgram ) {
 		qglBindProgramARB( GL_VERTEX_PROGRAM_ARB, VPROG_SOFT_INTERACTION );
 		qglBindProgramARB( GL_FRAGMENT_PROGRAM_ARB, FPROG_SOFT_INTERACTION );
+	} else if ( useAmbientSSAOProgram ) {
+		qglBindProgramARB( GL_VERTEX_PROGRAM_ARB, VPROG_INTERACTION );
+		qglBindProgramARB( GL_FRAGMENT_PROGRAM_ARB, FPROG_AMBIENT_SSAO );
 	} else {
 		qglBindProgramARB( GL_VERTEX_PROGRAM_ARB, VPROG_INTERACTION );
 		qglBindProgramARB( GL_FRAGMENT_PROGRAM_ARB, FPROG_INTERACTION );
@@ -451,6 +499,17 @@ void RB_ARB2_CreateDrawInteractions( const drawSurf_t *surf ) {
 		}
 	} else if ( backEnd.vLight->lightShader->IsAmbientLight() ) {
 		globalImages->ambientNormalMap->Bind();
+		if ( useAmbientSSAOProgram ) {
+			RB_SetSSAOProgramParameters();
+			GL_SelectTextureNoClient( 7 );
+			globalImages->currentDepthImage->Bind();
+			GL_SelectTextureNoClient( 8 );
+			if ( rbSoftShadowBlueNoiseImage ) {
+				rbSoftShadowBlueNoiseImage->Bind();
+			} else {
+				globalImages->BindNull();
+			}
+		}
 	} else {
 		globalImages->normalCubeMapImage->Bind();
 	}
@@ -654,6 +713,7 @@ static progDef_t	progs[MAX_GLPROGS] = {
 	{ GL_FRAGMENT_PROGRAM_ARB, FPROG_SOFT_PARTICLE, "soft_particle.vfp" },
 	{ GL_VERTEX_PROGRAM_ARB, VPROG_SOFT_INTERACTION, "interaction.vfp" },
 	{ GL_FRAGMENT_PROGRAM_ARB, FPROG_SOFT_INTERACTION, "interaction_soft.fp" },
+	{ GL_FRAGMENT_PROGRAM_ARB, FPROG_AMBIENT_SSAO, "interaction_ssao.fp" },
 
 	// additional programs can be dynamically specified in materials
 };

@@ -994,6 +994,10 @@ extern idCVar r_enableDepthCapture; // DG: disable capturing depth buffer, used 
 extern idCVar r_useSoftParticles;
 extern idCVar r_useSoftShadows;
 extern idCVar r_softShadowRadius;
+extern idCVar r_useSSAO;
+extern idCVar r_ssaoRadius;
+extern idCVar r_ssaoStrength;
+extern idCVar r_ssaoBias;
 
 /*
 ====================================================================
@@ -1338,6 +1342,8 @@ typedef enum {
 	// Experimental depth-aware stencil-shadow filter.
 	VPROG_SOFT_INTERACTION,
 	FPROG_SOFT_INTERACTION,
+	// Experimental SSAO variant of the ambient interaction shader.
+	FPROG_AMBIENT_SSAO,
 	//
 	PROG_USER
 } program_t;
